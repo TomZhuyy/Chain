@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use url::Url;
+use reqwest::Client;
+use futures::executor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transaction {
@@ -56,21 +58,24 @@ struct Blockchain {
     current_transactions: Vec<Transaction>,
     difficulty: usize,
     nodes: HashSet<String>,
+    self_address: String,
 }
 
 impl Blockchain {
-    fn new() -> Self {
+    fn new(self_address: String) -> Self {
         let mut blockchain = Blockchain {
             chain: vec![],
             current_transactions: vec![],
             difficulty: 4,
             nodes: HashSet::new(),
+            self_address,
         };
         blockchain.new_block("0".to_string());
         blockchain
     }
 
     fn new_transaction(&mut self, tx: Transaction) {
+        println!("📨 新交易：{} → {}: {}", tx.sender, tx.recipient, tx.amount);
         self.current_transactions.push(tx);
     }
 
@@ -89,6 +94,7 @@ impl Blockchain {
         };
 
         let mined_block = proof_of_work(block, self.difficulty);
+        println!("⛏️ 区块已挖出：index={}, hash={}", mined_block.index, mined_block.hash);
         self.chain.push(mined_block);
         self.current_transactions.clear();
         self.chain.last().unwrap()
@@ -98,10 +104,11 @@ impl Blockchain {
         self.chain.last().unwrap()
     }
 
-    fn register_node(&mut self, address: &str) {
+    fn register_node(&mut self, address: &str) -> bool {
         if let Ok(parsed) = Url::parse(address) {
-            self.nodes.insert(parsed.origin().ascii_serialization());
+            return self.nodes.insert(parsed.origin().ascii_serialization());
         }
+        false
     }
 
     async fn resolve_conflicts(&mut self) -> bool {
@@ -111,6 +118,7 @@ impl Blockchain {
 
         for node in &self.nodes {
             let url = format!("{}/chain", node);
+            println!("🔄 正在尝试从 {} 获取链", url);
             if let Ok(res) = client.get(&url).send().await {
                 if let Ok(chain_data) = res.json::<Vec<Block>>().await {
                     if chain_data.len() > max_length {
@@ -122,9 +130,11 @@ impl Blockchain {
         }
 
         if let Some(chain) = new_chain {
+            println!("✅ 替换本地链为长度为 {} 的远程链", max_length);
             self.chain = chain;
             true
         } else {
+            println!("🟢 当前链已是最长");
             false
         }
     }
@@ -137,7 +147,7 @@ struct TransactionPayload {
     amount: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RegisterNodes {
     nodes: Vec<String>,
 }
@@ -161,8 +171,45 @@ async fn add_transaction(
 async fn mine_block(blockchain: web::Data<Mutex<Blockchain>>) -> impl Responder {
     let mut chain = blockchain.lock().unwrap();
     let prev_hash = chain.last_block().hash.clone();
-    let new_block = chain.new_block(prev_hash);
+    let new_block = chain.new_block(prev_hash).clone();
+    let peers = chain.nodes.clone();
+    drop(chain);
+
+    let client = reqwest::Client::new();
+    for node in peers {
+        let url = format!("{}/blocks/receive", node);
+        let block_to_send = new_block.clone();
+        match client.post(&url).json(&block_to_send).send().await {
+            Ok(res) => println!("✅ 已广播区块至 {node}，响应状态: {}", res.status()),
+            Err(e) => eprintln!("❌ 广播至 {node} 失败: {}", e),
+        }
+    }
+
     HttpResponse::Ok().json(new_block)
+}
+
+async fn receive_block(
+    blockchain: web::Data<Mutex<Blockchain>>,
+    block: web::Json<Block>,
+) -> impl Responder {
+    let mut chain = blockchain.lock().unwrap();
+    let last_block = chain.last_block().clone();
+
+    if block.previous_hash == last_block.hash && block.index == last_block.index + 1 {
+        if block.hash == block.calculate_hash() {
+            println!("📥 接收到新区块并成功加入链中：index = {}", block.index);
+            chain.chain.push(block.into_inner());
+            return HttpResponse::Ok().json("✅ 已添加新区块");
+        }
+    }
+
+    let blockchain = blockchain.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut chain = blockchain.lock().unwrap();
+        let _ = executor::block_on(chain.resolve_conflicts());
+    });
+
+    HttpResponse::Accepted().json("⚠️ 区块未接上，已触发链同步")
 }
 
 async fn get_chain(blockchain: web::Data<Mutex<Blockchain>>) -> impl Responder {
@@ -175,23 +222,49 @@ async fn register_nodes(
     payload: web::Json<RegisterNodes>,
 ) -> impl Responder {
     let mut chain = blockchain.lock().unwrap();
+
     for node in &payload.nodes {
-        chain.register_node(node);
+        println!("🔗 注册节点: {}", node);
+        if let Ok(parsed) = Url::parse(node) {
+            let origin = parsed.origin().ascii_serialization();
+            let is_new = chain.nodes.insert(origin.clone());
+
+            if is_new {
+                let reverse_payload = RegisterNodes {
+                    nodes: vec![chain.self_address.clone()],
+                };
+                let url = format!("{}/nodes/register", node);
+
+                tokio::spawn(async move {
+                    let client = Client::new();
+                    let res = client
+                        .post(&url)
+                        .json(&reverse_payload)
+                        .timeout(std::time::Duration::from_secs(3))
+                        .send()
+                        .await;
+
+                    match res {
+                        Ok(resp) => println!("↩️ 反向注册响应: {}", resp.status()),
+                        Err(e) => eprintln!("❌ 反向注册失败: {}", e),
+                    }
+                });
+            }
+        }
     }
-    HttpResponse::Ok().json("✅ 节点已注册")
+
+    println!("📌 当前注册节点: {:?}", chain.nodes);
+    HttpResponse::Ok().json("✅ 节点已注册（包含双向注册）")
 }
 
 async fn resolve_chain(blockchain: web::Data<Mutex<Blockchain>>) -> impl Responder {
     let blockchain = blockchain.clone();
-    let replaced = {
-        let blockchain = blockchain.clone();
-        actix_web::rt::spawn(async move {
-            let mut chain = blockchain.lock().unwrap();
-            chain.resolve_conflicts().await
-        })
-        .await
-        .unwrap_or(false)
-    };
+    let replaced = tokio::task::spawn_blocking(move || {
+        let mut chain = blockchain.lock().unwrap();
+        executor::block_on(chain.resolve_conflicts())
+    })
+    .await
+    .unwrap_or(false);
 
     if replaced {
         HttpResponse::Ok().json("✅ 本节点链已被替换为最长链")
@@ -202,8 +275,11 @@ async fn resolve_chain(blockchain: web::Data<Mutex<Blockchain>>) -> impl Respond
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let blockchain = web::Data::new(Mutex::new(Blockchain::new()));
-    println!("🌐 区块链节点启动中: http://localhost:8889");
+    let self_address = std::env::var("SELF_ADDRESS").unwrap_or_else(|_| "http://localhost:8888".to_string());
+    let bind_addr = self_address.strip_prefix("http://").unwrap_or("127.0.0.1:8888");
+
+    let blockchain = web::Data::new(Mutex::new(Blockchain::new(self_address.clone())));
+    println!("🌐 区块链节点启动中: {}", self_address);
 
     HttpServer::new(move || {
         App::new()
@@ -213,8 +289,9 @@ async fn main() -> std::io::Result<()> {
             .route("/chain", web::get().to(get_chain))
             .route("/nodes/register", web::post().to(register_nodes))
             .route("/nodes/resolve", web::get().to(resolve_chain))
+            .route("/blocks/receive", web::post().to(receive_block))
     })
-    .bind("127.0.0.1:8889")?
+    .bind(bind_addr)?
     .run()
     .await
 }

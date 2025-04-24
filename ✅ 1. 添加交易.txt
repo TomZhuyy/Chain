@@ -1,0 +1,59 @@
+✅ 1. 添加交易
+方法：POST /transactions/new
+URL：http://localhost:8888/transactions/new
+Body（JSON）：
+
+json
+复制
+编辑
+{
+  "sender": "Alice",
+  "recipient": "Bob",
+  "amount": 50
+}
+✅ 2. 挖矿（打包新区块）
+方法：GET /mine
+URL：http://localhost:8888/mine
+
+💡 这会将当前所有未打包交易封装成一个新区块，并尝试广播到其他节点。
+
+✅ 3. 查看当前区块链
+方法：GET /chain
+URL：http://localhost:8888/chain
+你会看到当前节点的完整区块链（包含所有区块）。
+
+✅ 4. 注册节点（用于共识同步）
+方法：POST /nodes/register
+URL：http://localhost:8888/nodes/register
+Body（JSON）：
+
+json
+复制
+编辑
+{
+  "nodes": ["http://localhost:8889"]
+}
+🔄 成功后将自动进行反向注册（如果是首次注册）。
+
+✅ 5. 手动触发链同步（共识机制）
+方法：GET /nodes/resolve
+URL：http://localhost:8888/nodes/resolve
+
+💡 当前链短于其他节点时会自动替换为最长链。
+
+✅ 6. 接收其他节点广播的区块（自动调用）
+方法：POST /blocks/receive
+URL：http://localhost:8888/blocks/receive
+说明：这个接口由其他节点自动调用，通常不手动测试。但你也可以自己测试：
+
+json
+复制
+编辑
+{
+  "index": 2,
+  "timestamp": "2024-01-01T00:00:00Z",
+  "transactions": [{"sender":"A","recipient":"B","amount":1}],
+  "previous_hash": "...",
+  "nonce": 123,
+  "hash": "..."
+}
